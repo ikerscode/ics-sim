@@ -9,6 +9,11 @@ reservoir, distribution pump and network), a scan-cycle PLC exposed over Modbus/
 MITRE ATT&CK for ICS, seven switchable mitigations and a consequence model that scores every run.
 Everything runs locally and the attacks only ever touch this simulator.
 
+There is also an optional containerised network mode (docker compose). The PLC sits on its own
+control network behind a small Modbus firewall container, with the HMI in the DMZ and the lab
+client in Enterprise IT. It shows the scenarios' traffic crossing a real network boundary that
+makes the same decisions as the simulator. See [docs/NETWORK_MODE.md](docs/NETWORK_MODE.md).
+
 ## Architecture
 
 ```
@@ -36,7 +41,18 @@ Everything runs locally and the attacks only ever touch this simulator.
                                                      |  ConsequenceTracker: hazards, availability, quality   |
                                                      +------------------------------------------------------+
                                                        runner.py: fast-forward runs, baseline, matrix
+                                                                  (N seeds per cell, aggregated)
                                                        storage.py: SQLite + Markdown/HTML reports in data/
+```
+
+Optional network mode (`./netmode.sh`, details in docs/NETWORK_MODE.md):
+
+```
+ [enterprise 192.168.10.0/24]      [dmz 10.10.2.0/24]              [control 10.10.1.0/24]
+  labclient .37 (CORP-WS-37)        hmi .10  ews .20  rogue .66      plc .10 (icssim serve)
+        |                                  |                               |
+        +---------------- fw (icssim/fwgate.py): segmentation + DPI -------+
+                          logs every decision, forwards with PROXY v1, relays HUD to 127.0.0.1:8124
 ```
 
 ## Quick start
@@ -53,11 +69,13 @@ python -m icssim baseline --hours 24                    # 24 h with all mitigati
 python -m icssim run-scenario oldsmar --fast            # fast-forward, no mitigations, report in data/reports/
 python -m icssim run-scenario oldsmar --fast --mitigations eng_limits,sis
 python -m icssim run-scenario replay_masking            # real time: starts on the running server (watch the HUD)
-python -m icssim matrix --write-docs                    # every scenario x mitigation, about 50 s with 2 workers
+python -m icssim matrix --write-docs                    # every scenario x mitigation, 5 seeds per cell, 2 workers
+python -m icssim matrix --seeds 1                       # the quick single-seed version (about 40 s)
 python -m icssim report                                 # list reports; `report <run-id>` prints one
 python -m icssim serve                                  # same as run.sh without the venv setup
 python -m icssim docs                                   # regenerate docs/REGISTER_MAP.md
 python tools/read_plant.py --watch 2                    # standalone Modbus client, no dependencies
+./netmode.sh verify                                     # optional: containerised network mode check (docker)
 ```
 
 Poking the PLC with your own tools (it only listens on localhost):
@@ -72,7 +90,7 @@ The `+` in `+modbus-discover` makes nmap run the script on a non-standard port. 
 Matrix & Log tab (default LAB-CLIENT 10.10.2.50 on the supervisory LAN). With the firewall on, that host
 is not allowlisted, so your tools time out. Switch it to EWS-01 and they work again.
 
-Tests: `.venv/bin/python -m pytest -q` (68 tests, about 30 s).
+Tests: `.venv/bin/python -m pytest -q` (90 tests, about 35 s).
 
 ## HUD tour
 
@@ -89,8 +107,11 @@ The HUD has three tabs and every core feature has its own button.
   real-time on live plant" (watch it on the Plant tab, then "Stop real-time" to write the report). It
   shows the result scorecard against the baseline, the detection table and the timeline, plus past runs
   with HTML and Markdown report links.
-- **Matrix & Log**: "Run matrix" fills the scenario x mitigation table, with baseline false-alert counts
-  and links to matrix.html and matrix.md. Below that are the live Modbus transaction log (source, zone,
+- **Matrix & Log**: "Run matrix" fills the scenario x mitigation table for the chosen number of seeds
+  per cell (default 5). Each cell shows the majority outcome as a proportion (for example
+  PREVENTED 5/5), the median time with [min-max] over seeds and the availability range. Cells where
+  the seeds disagree get a dashed outline and a "seeds disagree" line. Hovering shows every seed's
+  outcome. Below the table are the baseline false-alert counts and links to matrix.html and matrix.md. Below that are the live Modbus transaction log (source, zone,
   unit, function code, address, value, allowed/blocked/dropped and why), the mapping for external TCP
   clients, the Purdue zones and firewall policy, and the register map for both units.
 
@@ -103,12 +124,14 @@ with `./run.sh` first, then:
     python -m icssim tui --url http://127.0.0.1:8104 --once
 
 The views are Plant (HMI values and alarms, refreshed every 2 s), Scenarios, Reports (Enter opens a
-run's JSON) and Modbus log. The spec lives in `icssim/tui_spec.py`.
+run's JSON), Matrix (one row per cell with its seed proportion and agreement flag, from
+`/api/matrix/cells`) and Modbus log. The spec lives in `icssim/tui_spec.py`.
 
 - Keys: `1`-`9` or Tab switch view, Up/Down/PgUp/PgDn move, Enter opens a detail, Esc or Backspace
   goes back, `q` quits.
 - Action keys: `f` oldsmar fast-forward with no mitigations, `m` oldsmar with all mitigations,
-  `x` run the matrix (asks first), `z` reset the plant (asks first), `a` acknowledge alarms.
+  `x` run the matrix with 5 seeds, `s` run it with 1 seed (both ask first), `z` reset the plant (asks
+  first), `a` acknowledge alarms.
 - `--once` prints every view as plain text and exits, which suits SSH sessions without a usable
   terminal or scripted checks. It exits 1 if any view cannot reach the server.
 
@@ -124,7 +147,9 @@ run's JSON) and Modbus log. The spec lives in `icssim/tui_spec.py`.
 | Independent SIS with redundant sensors, toggleable | `sis.py`, `Plant.sis_sensors` |
 | Hazards, availability, compliance, safety score, time to hazard, cited limits | `consequences.py`, `constants.py`, [docs/REFERENCES.md](docs/REFERENCES.md) |
 | Eight ATT&CK-mapped scenarios, real-time or fast-forward, reports vs baseline | `scenarios.py`, `runner.py`, `report.py`, `storage.py` |
-| Mitigations toggled individually; matrix from real runs under 2 minutes | `sim.set_mitigations`, `network.py`, `detector.py`, `hmi.py`; `runner.matrix` (about 45-50 s) |
+| Mitigations toggled individually; matrix from real runs | `sim.set_mitigations`, `network.py`, `detector.py`, `hmi.py`; `runner.matrix` |
+| Several seeds per matrix cell, proportions, median and range, disagreement flag | `runner.aggregate_cell`, `report.matrix_markdown`, `POST /api/matrix/run {"seeds": N}`, `GET /api/matrix/cells` |
+| Optional containerised network mode with a real firewall boundary | `deploy/`, `netmode.sh`, `icssim/fwgate.py`, `icssim/netagent.py`, `icssim/netmode.py`, [docs/NETWORK_MODE.md](docs/NETWORK_MODE.md) |
 | Event log: Modbus transactions, alarms, detector alerts, SIS trips | `events.py` |
 | HUD | `static/index.html`, `static/app.js`, shared `hud.js`/`hud.css` |
 | CLI and example client | `icssim/__main__.py`, `tools/read_plant.py` |
@@ -162,6 +187,24 @@ implementation (about 300 lines) made that simpler and removed a dependency.
 ## Results
 
 The full matrix with times is in [docs/MATRIX.md](docs/MATRIX.md) (regenerate with `python -m icssim matrix --write-docs`).
+It now runs every cell for five seeds (1-5). That is 405 runs including the baselines, which took
+344 s wall time on the two-worker pool under the lab CPU lock at nice 19, with other jobs running on the
+laptop (608 s of simulation in total).
+
+What the extra seeds showed:
+
+- No cell flips. All 72 cells give the same outcome for all five seeds, and the 45 baseline runs raise no
+  false alerts and no hazards. The old table was seed 1 only. Re-running seed 1 reproduces it exactly
+  (outcome, time and availability in every cell), and no cell's five-seed majority differs from it.
+- The spread is small. Times to hazard vary by about 1 minute at most (logic tamper 61.5-62.7 min,
+  oldsmar 41.4-42.4 min). SIS trip times vary by up to 1.2 min (logic tamper 49.8-51.0 min, insider
+  47.3-48.5 min).
+- The widest spread is the attended operator against the logic tamper: it stops the overflow after
+  41.5-43.0 min, with availability between 84 % and 87 %. The cell the old README flagged as borderline,
+  the operator against FDI, holds at 49.0 min for every seed.
+- The seed only varies process and sensor noise. Operator reaction times and attack timing are fixed,
+  so this says the results are robust to noise, not to a different operator (see Limitations).
+
 Some findings:
 
 - No single mitigation covers everything. Segmentation and the firewall stop attacks from the wrong
@@ -173,9 +216,9 @@ Some findings:
   turns a quality incident into a supply outage, with availability between 22 % and 58 % in those runs.
   It cannot help against the DoS, and it is useless once bypassed.
 - The HMAC integrity check is the only control that spots the replay quickly (10 min, the moment replay
-  starts). It sees nothing when the PLC itself is fooled (FDI) or reprogrammed.
+  starts, for every seed). It sees nothing when the PLC itself is fooled (FDI) or reprogrammed.
 - The physics-based detector raises an alert in every scenario, with no false alerts in 3 h or 24 h
-  baselines, but it only detects. Its replay detection comes late (about 37 min) because closing a valve
+  baselines, but it only detects. Its replay detection comes late (37.1-37.6 min) because closing a valve
   is physically consistent until the pump starts cavitating.
 - The attended operator does well when changes are visible and is blind to the replay. That is the point
   of Stuxnet-style masking.
@@ -188,6 +231,10 @@ Some findings:
   labels inside the simulation.
 - No exploit code, no malware, no network scanning beyond what you run yourself against localhost.
 - Data (SQLite index and reports) stays in `data/` and is gitignored.
+- Network mode: the Purdue networks are Docker `internal` networks with no route out. Every container
+  runs as uid 10001 with a read-only root filesystem, `cap_drop: [ALL]` and `no-new-privileges`. The
+  only host port is the PLC HUD on 127.0.0.1:8124. The PLC accepts a PROXY source header only from the
+  gateway's address. Replayed traffic only goes to the lab's own gateway and PLC containers.
 
 ## Limitations
 
@@ -197,8 +244,15 @@ Some findings:
 - Plant sizing and tuning were chosen so attacks play out in a three-hour window.
 - The PLC comms watchdog is a stylised model. Many modern PLCs would not fault under a read flood.
 - The operator is a scripted playbook with fixed reaction times.
-- Each matrix cell is a single seed. Results near a threshold (for example the operator saving the FDI
-  case) could flip with other seeds or reaction times.
+- The matrix now runs several seeds per cell, but the seed only changes demand noise, storm timing and
+  sensor noise. Operator reaction times, attack timing and plant tuning are fixed, so the agreement
+  across seeds shows that the outcomes hold up against process noise. It does not show they would
+  hold for a different operator or a different plant.
+- Network mode has been run and checked once on this laptop (2026-11-14). All 444 gateway decisions
+  matched the simulator's policy code, and all 90 replayed scenario and probe items got the same
+  decision as in-process (docs/NETWORK_MODE.md). It is a functional check of the policy at a real
+  boundary, not a timing or load test. The replay keeps request order but not simulated timing, and it
+  samples the flood.
 - Firewall DPI checks function codes and write targets but not value ranges. Some commercial ICS
   firewalls can also check values, which would make them behave like the engineering limits here.
 - Real-time scenario reports compare against a fast-forward baseline started at the same clock time,
@@ -208,7 +262,7 @@ Some findings:
 
 ## Ideas for extension
 
-- Monte Carlo over seeds and operator reaction times to put confidence intervals on the matrix.
+- Vary operator reaction times and attack start times as well as the seed, and report intervals.
 - Modbus/TCP Security (TLS, port 802) as a further mitigation.
 - A second PLC and a network model with latency and packet loss.
 - Storm and demand events in the scenario timeline, and attacks that time themselves to them.

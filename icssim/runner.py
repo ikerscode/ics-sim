@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import statistics
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 
 from .constants import MITIGATIONS
@@ -12,6 +14,10 @@ from .sim import Simulation
 COLUMNS = ["none"] + MITIGATIONS + ["all"]
 DETECTION_SOURCES = set(MITIGATIONS)
 TIMELINE_KINDS = {"attack", "alert", "hazard", "sis", "operator", "plc", "hmi", "alarm"}
+DEFAULT_SEEDS = 5           # seeds per matrix cell
+MAX_SEEDS = 10              # keeps a matrix run under about 10 minutes on two workers
+# Worst first. When two outcomes are equally common across seeds the worse one is reported.
+OUTCOME_ORDER = ["hazard", "not detected", "detected", "prevented", "no hazard"]
 
 
 def column_mitigations(col: str) -> set[str]:
@@ -119,26 +125,116 @@ def _baseline_cell(args):
                  "alerts": [a["message"] for a in res["alerts"]][:5]}
 
 
-def matrix(seed: int = 1, workers: int = 2, progress=None, scenarios=None) -> dict:
-    """Run every scenario x mitigation column fast-forward (in up to `workers` processes)."""
+# ------------------------------------------------------------ seed aggregation
+def seed_list(n_seeds: int, first: int = 1) -> list[int]:
+    """Seeds used for a matrix run: first, first+1, ... (seed 1 is the old single-seed table)."""
+    if not 1 <= n_seeds <= MAX_SEEDS:
+        raise ValueError(f"seeds must be between 1 and {MAX_SEEDS}")
+    return list(range(first, first + n_seeds))
+
+
+def spread(values) -> dict:
+    """Median, min, max and count of the non-None values (None everywhere -> all None, n 0)."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return {"median": None, "min": None, "max": None, "n": 0}
+    return {"median": round(statistics.median(vals), 1), "min": min(vals), "max": max(vals), "n": len(vals)}
+
+
+def majority(outcomes) -> str:
+    """Most common outcome; ties go to the worse outcome so a flip is never reported optimistically."""
+    counts = Counter(outcomes)
+    top = max(counts.values())
+    return min((o for o, k in counts.items() if k == top), key=OUTCOME_ORDER.index)
+
+
+def outcome_label(counts: dict, n: int) -> str:
+    """'prevented 5/5' or 'prevented 3/5, detected 2/5' (most common first)."""
+    order = sorted(counts.items(), key=lambda kv: (-kv[1], OUTCOME_ORDER.index(kv[0])))
+    return ", ".join(f"{o} {k}/{n}" for o, k in order)
+
+
+def aggregate_cell(per_seed: list[dict]) -> dict:
+    """Combine one cell's per-seed classify() results (each with a "seed" key).
+
+    Keeps the single-seed field names (outcome, ttd_s, tth_s, availability_pct ...) with the
+    median as their value, so older readers of the matrix JSON still work, and adds the
+    proportion, min/max and an agreement flag.
+    """
+    n = len(per_seed)
+    counts = dict(Counter(c["outcome"] for c in per_seed))
+    ttd = spread(c["ttd_s"] for c in per_seed)
+    tth = spread(c["tth_s"] for c in per_seed)
+    av = spread(c["availability_pct"] for c in per_seed)
+    by = Counter(c["detected_by"] for c in per_seed if c["detected_by"])
+    hazard_counts = Counter(h for c in per_seed for h in c["hazards"])
+    return {
+        "outcome": majority(c["outcome"] for c in per_seed),
+        "outcome_counts": counts,
+        "outcome_label": outcome_label(counts, n),
+        "agree": len(counts) == 1,
+        "n_seeds": n,
+        "ttd_s": ttd["median"], "ttd_min_s": ttd["min"], "ttd_max_s": ttd["max"], "ttd_n": ttd["n"],
+        "tth_s": tth["median"], "tth_min_s": tth["min"], "tth_max_s": tth["max"], "tth_n": tth["n"],
+        "availability_pct": av["median"], "availability_min_pct": av["min"], "availability_max_pct": av["max"],
+        "quality_compliance_pct": spread(c["quality_compliance_pct"] for c in per_seed)["median"],
+        "safety_score": spread(c["safety_score"] for c in per_seed)["median"],
+        "detected_by": by.most_common(1)[0][0] if by else None,
+        "hazards": sorted(hazard_counts),
+        "hazard_counts": dict(hazard_counts),
+        "per_seed": [{k: c.get(k) for k in ("seed", "outcome", "ttd_s", "tth_s", "availability_pct", "detected_by")}
+                     for c in sorted(per_seed, key=lambda c: c["seed"])],
+    }
+
+
+def aggregate_baseline(per_seed: list[dict]) -> dict:
+    """Baseline (no attack) column over seeds: total false alerts, union of hazards, worst availability."""
+    return {"false_alerts": sum(b["false_alerts"] for b in per_seed),
+            "false_alerts_per_seed": [b["false_alerts"] for b in per_seed],
+            "hazards": sorted({h for b in per_seed for h in b["hazards"]}),
+            "availability_pct": min(b["availability_pct"] for b in per_seed),
+            "alerts": [a for b in per_seed for a in b["alerts"]][:5]}
+
+
+def disagreements(cells: dict) -> list[dict]:
+    """Cells whose outcome differs across seeds."""
+    return [{"scenario": k, "column": c, "label": cell["outcome_label"]}
+            for k, row in cells.items() for c, cell in row.items() if not cell["agree"]]
+
+
+def matrix(seed: int = 1, workers: int = 2, progress=None, scenarios=None, n_seeds: int = DEFAULT_SEEDS) -> dict:
+    """Run every scenario x mitigation column for `n_seeds` seeds (in up to `workers` processes).
+
+    Each cell is aggregated over the seeds (see aggregate_cell). The baseline row is the same
+    columns with no attack, also over every seed, to count false alerts.
+    """
+    seeds = seed_list(n_seeds, seed)
     keys = list(scenarios or SCENARIOS)
-    jobs = [(k, c, seed) for k in keys for c in COLUMNS]
+    jobs = [(k, c, s) for k in keys for c in COLUMNS for s in seeds]
+    base_jobs = [(c, s) for c in COLUMNS for s in seeds]
     t0 = time.perf_counter()
-    cells: dict = {k: {} for k in keys}
+    raw: dict = {(k, c): [] for k in keys for c in COLUMNS}
+    raw_base: dict = {c: [] for c in COLUMNS}
+    run_s = 0.0
     done = 0
-    total = len(jobs) + len(COLUMNS)
-    with ProcessPoolExecutor(max_workers=max(1, workers)) as ex:
-        for k, c, cell, _ in ex.map(_cell, jobs):
-            cells[k][c] = cell
+    total = len(jobs) + len(base_jobs)
+    with ProcessPoolExecutor(max_workers=max(1, min(workers, 2))) as ex:
+        for (k, c, cell, wall), (_, _, s) in zip(ex.map(_cell, jobs), jobs):
+            raw[(k, c)].append({**cell, "seed": s})
+            run_s += wall
             done += 1
             if progress:
                 progress(done, total)
-        baseline = {}
-        for c, info in ex.map(_baseline_cell, [(c, seed) for c in COLUMNS]):
-            baseline[c] = info
+        for (c, info), (_, s) in zip(ex.map(_baseline_cell, base_jobs), base_jobs):
+            raw_base[c].append({**info, "seed": s})
             done += 1
             if progress:
                 progress(done, total)
-    return {"seed": seed, "columns": COLUMNS, "scenarios": [SCENARIOS[k].describe() for k in keys],
-            "cells": cells, "baseline": baseline, "horizon_s": HORIZON, "attack_at_s": ATTACK_AT,
+    cells = {k: {c: aggregate_cell(raw[(k, c)]) for c in COLUMNS} for k in keys}
+    baseline = {c: aggregate_baseline(raw_base[c]) for c in COLUMNS}
+    return {"seed": seeds[0], "seeds": seeds, "n_seeds": len(seeds), "columns": COLUMNS,
+            "scenarios": [SCENARIOS[k].describe() for k in keys],
+            "cells": cells, "baseline": baseline, "disagreements": disagreements(cells),
+            "horizon_s": HORIZON, "attack_at_s": ATTACK_AT, "runs": total, "workers": max(1, min(workers, 2)),
+            "sim_run_s": round(run_s, 1),
             "wall_s": round(time.perf_counter() - t0, 1), "generated": time.strftime("%Y-%m-%d %H:%M:%S")}

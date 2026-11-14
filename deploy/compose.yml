@@ -1,0 +1,106 @@
+# Optional containerised network mode for ics-sim (the in-process simulator stays the default).
+# Run it with ./netmode.sh (verify | up | down); see docs/NETWORK_MODE.md.
+#
+#   enterprise 192.168.10.0/24   labclient 192.168.10.37 (CORP-WS-37, lab Modbus client)
+#        |
+#       fw  192.168.10.254 | 10.10.2.254 | 10.10.1.254   Modbus gateway: segmentation + DPI
+#        |
+#   dmz 10.10.2.0/24             hmi 10.10.2.10, ews 10.10.2.20, rogue 10.10.2.66
+#        |
+#   control 10.10.1.0/24         plc 10.10.1.10 (simulator, Modbus 5020, HUD 8104)
+#
+# The three Purdue networks are internal (no route out, no route between them). The
+# gateway is the only container on more than one of them. It also joins "edge", a
+# bridge with masquerading off, only to relay the PLC HUD to 127.0.0.1:8124 on the host.
+name: ics-sim-net
+
+networks:
+  enterprise:
+    internal: true
+    ipam: {config: [{subnet: 192.168.10.0/24}]}
+  dmz:
+    internal: true
+    ipam: {config: [{subnet: 10.10.2.0/24}]}
+  control:
+    internal: true
+    ipam: {config: [{subnet: 10.10.1.0/24}]}
+  edge:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam: {config: [{subnet: 10.10.99.0/24}]}
+
+x-hardening: &hardening
+  image: ics-sim-net:0.1.0
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "10001:10001"
+  tmpfs: ["/tmp:size=8m,mode=1777"]
+  pids_limit: 64
+  mem_limit: 128m
+  cpus: 0.25
+
+services:
+  plc:
+    <<: *hardening
+    build: {context: .., dockerfile: deploy/Dockerfile}
+    command: ["icssim", "serve", "--host", "0.0.0.0", "--port", "8104"]
+    mem_limit: 256m
+    cpus: 0.5
+    tmpfs: ["/tmp:size=8m,mode=1777", "/app/data:size=32m,uid=10001,gid=10001,mode=0700"]
+    environment:
+      ICSSIM_MODBUS_HOST: 0.0.0.0
+      ICSSIM_MODBUS_PORT: "5020"
+      ICSSIM_TRUSTED_PROXIES: 10.10.1.254   # only the gateway may state a client's source address
+    networks:
+      control: {ipv4_address: 10.10.1.10}
+
+  fw:
+    <<: *hardening
+    command: ["icssim.fwgate"]
+    depends_on: [plc]
+    environment:
+      FW_LISTEN: 192.168.10.254:5020,10.10.2.254:5020
+      FW_UPSTREAM: 10.10.1.10:5020
+      FW_RELAY: 10.10.99.254:8104=10.10.1.10:8104
+      FW_SEGMENTATION: "1"
+      FW_DPI: "1"
+    networks:
+      enterprise: {ipv4_address: 192.168.10.254}
+      dmz: {ipv4_address: 10.10.2.254}
+      control: {ipv4_address: 10.10.1.254}
+      edge: {ipv4_address: 10.10.99.254}
+    ports:
+      - "127.0.0.1:8124:8104"
+
+  hmi:
+    <<: *hardening
+    command: ["icssim.netagent", "hmi-poll"]
+    depends_on: [fw]
+    environment: {AGENT_GATEWAY: "10.10.2.254:5020"}
+    networks:
+      dmz: {ipv4_address: 10.10.2.10}
+
+  ews:
+    <<: *hardening
+    command: ["icssim.netagent", "idle"]
+    depends_on: [fw]
+    environment: {AGENT_GATEWAY: "10.10.2.254:5020"}
+    networks:
+      dmz: {ipv4_address: 10.10.2.20}
+
+  rogue:
+    <<: *hardening
+    command: ["icssim.netagent", "idle"]
+    depends_on: [fw]
+    environment: {AGENT_GATEWAY: "10.10.2.254:5020"}
+    networks:
+      dmz: {ipv4_address: 10.10.2.66}
+
+  labclient:
+    <<: *hardening
+    command: ["icssim.netagent", "idle"]
+    depends_on: [fw]
+    environment: {AGENT_GATEWAY: "192.168.10.254:5020"}
+    networks:
+      enterprise: {ipv4_address: 192.168.10.37}

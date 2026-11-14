@@ -93,35 +93,100 @@ def scenario_markdown(run_id: str, data: dict) -> str:
     return "\n".join(out)
 
 
+def _span(med, lo, hi, fmt) -> str:
+    """'60 s' when every seed agrees, else '60 s [40 s-90 s]' (median [min-max])."""
+    if med is None:
+        return "-"
+    if lo is None or fmt(lo) == fmt(hi):
+        return fmt(med)
+    return f"{fmt(med)} [{fmt(lo)}-{fmt(hi)}]"
+
+
+def _pct(v) -> str:
+    return f"{v:.0f}"
+
+
+def matrix_cell_text(cell: dict) -> str:
+    """One Markdown table cell: majority outcome with its seed count, median [min-max] times, availability."""
+    o, n = cell["outcome"], cell.get("n_seeds", 1)
+    k = cell.get("outcome_counts", {o: n}).get(o, n)
+    frac = f" {k}/{n}" if n > 1 else ""
+    ttd = _span(cell["ttd_s"], cell.get("ttd_min_s"), cell.get("ttd_max_s"), _fmt_s)
+    if o == "hazard":
+        txt = f"**HAZARD**{frac} in " + _span(cell["tth_s"], cell.get("tth_min_s"), cell.get("tth_max_s"), _fmt_s)
+    elif o == "prevented":
+        txt = f"**PREVENTED**{frac}" + (f" ({ttd})" if cell["ttd_s"] is not None else "")
+    elif o == "detected":
+        txt = f"**DETECTED**{frac} {ttd}"
+    else:
+        txt = f"{o}{frac}"
+    if n > 1 and cell.get("ttd_s") is not None and cell.get("ttd_n", n) < n and o != "hazard":
+        txt += f" (alert in {cell['ttd_n']}/{n})"
+    txt += " av " + _span(cell["availability_pct"], cell.get("availability_min_pct"),
+                          cell.get("availability_max_pct"), _pct)
+    if not cell.get("agree", True):
+        txt = "MIXED " + txt + " (" + cell["outcome_label"] + ")"
+    return txt
+
+
 def matrix_markdown(mx: dict) -> str:
     cols = mx["columns"]
+    seeds = mx.get("seeds", [mx["seed"]])
+    seed_txt = (f"seeds {seeds[0]}-{seeds[-1]} ({len(seeds)} per cell)" if len(seeds) > 1 else f"seed {seeds[0]}")
     out = ["# Scenario x mitigation matrix", "",
-           f"Run on {mx['generated']}, seed {mx['seed']}, each cell a {mx['horizon_s'] / 3600:.0f} h fast-forward run "
-           f"with the attack at +{mx['attack_at_s'] / 60:.0f} min. Wall time {mx['wall_s']} s.", "",
+           f"Run on {mx['generated']}, {seed_txt}, each cell a {mx['horizon_s'] / 3600:.0f} h fast-forward run "
+           f"with the attack at +{mx['attack_at_s'] / 60:.0f} min. "
+           f"{mx.get('runs', '')} runs on {mx.get('workers', 2)} workers, wall time {mx['wall_s']} s"
+           + (f" ({mx['sim_run_s']} s of simulation)." if "sim_run_s" in mx else "."), "",
            "Legend: **HAZARD** = target hazard occurred with no mitigation; **PREVENTED** = target hazard did not occur; "
            "**DETECTED** = hazard occurred but the mitigation raised an alert (time to detect from attack start); "
            "**not detected** = hazard occurred, no alert from that mitigation. `av` = availability %. "
            "Scenarios marked (SIS required) always run with the SIS installed.", ""]
-    head = ["Scenario"] + [("none" if c == "none" else "all" if c == "all" else c) for c in cols]
+    if len(seeds) > 1:
+        out += [f"Each cell shows the majority outcome and how many of the {len(seeds)} seeds gave it, then the median "
+                "time and availability with the range over seeds in brackets as [min-max] (no brackets when every "
+                "seed gave the same number). Times to detect are medians over the seeds that raised an alert. "
+                "**MIXED** marks a cell where seeds gave different outcomes; ties are reported as the worse "
+                "outcome. The seed changes demand noise, the storm timing and sensor noise; operator reaction times "
+                "are fixed.", ""]
+    head = ["Scenario"] + list(cols)
     out += [_row(head), "|" + "---|" * len(head)]
     for sc in mx["scenarios"]:
         cells = mx["cells"][sc["key"]]
         row = [sc["key"] + (" (SIS required)" if sc["requires"] else "")]
-        for c in cols:
-            cell = cells[c]
-            o = cell["outcome"]
-            if o == "hazard":
-                txt = f"**HAZARD** in {_fmt_s(cell['tth_s'])}"
-            elif o == "prevented":
-                txt = "**PREVENTED**" + (f" ({_fmt_s(cell['ttd_s'])})" if cell["ttd_s"] is not None else "")
-            elif o == "detected":
-                txt = f"**DETECTED** {_fmt_s(cell['ttd_s'])}"
-            else:
-                txt = o
-            txt += f" av {cell['availability_pct']:.0f}"
-            row.append(txt)
+        row += [matrix_cell_text(cells[c]) for c in cols]
         out.append(_row(row))
-    out += ["", "## Baseline false positives (no attack, same horizon)", "", "| Column | Alerts | Hazards | Availability % |", "|---|---|---|---|"]
+
+    if len(seeds) > 1:
+        out += ["", "## Cells where seeds disagree", ""]
+        mixed = mx.get("disagreements", [])
+        if not mixed:
+            out.append(f"None: every cell gave the same outcome for all {len(seeds)} seeds.")
+        else:
+            out += ["| Scenario | Column | Outcomes | Per seed |", "|---|---|---|---|"]
+            for d in mixed:
+                per = mx["cells"][d["scenario"]][d["column"]]["per_seed"]
+                txt = "; ".join(f"{p['seed']}: {p['outcome']}" + (f" ({_fmt_s(p['ttd_s'])})" if p["ttd_s"] is not None else "")
+                                for p in per)
+                out.append(_row([d["scenario"], d["column"], d["label"], txt]))
+        if seeds[0] == 1:
+            out += ["", "## Compared with the single-seed table (seed 1 only)", ""]
+            changed = []
+            for sc in mx["scenarios"]:
+                for c in cols:
+                    cell = mx["cells"][sc["key"]][c]
+                    s1 = next((p for p in cell["per_seed"] if p["seed"] == 1), None)
+                    if s1 and s1["outcome"] != cell["outcome"]:
+                        changed.append(_row([sc["key"], c, s1["outcome"], cell["outcome_label"]]))
+            if changed:
+                out += ["| Scenario | Column | Seed 1 alone | Over all seeds |", "|---|---|---|---|"] + changed
+            else:
+                out.append("No cell's majority outcome differs from its seed 1 outcome.")
+
+    out += ["", "## Baseline false positives (no attack, same horizon)", ""]
+    n = len(seeds)
+    out += [f"Totals over {n} baseline runs per column." if n > 1 else "", "",
+            "| Column | Alerts | Hazards | Availability % (worst seed) |", "|---|---|---|---|"]
     for c in cols:
         b = mx["baseline"][c]
         out.append(_row([c, b["false_alerts"], ", ".join(b["hazards"]) or "none", b["availability_pct"]]))

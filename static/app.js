@@ -189,15 +189,23 @@ async function renderRuns() {
 async function renderMatrix() {
   const { job, matrix } = await api("/api/matrix");
   document.getElementById("mxStatus").textContent = job.running ? `running ${job.done}/${job.total}` :
-    job.error ? `error: ${job.error}` : matrix ? `last run ${matrix.generated}, ${matrix.wall_s} s` : "no matrix yet";
+    job.error ? `error: ${job.error}` : matrix ? `last run ${matrix.generated}, ${(matrix.seeds || [matrix.seed]).length} seed(s) per cell, ` +
+      `${matrix.wall_s} s` + (matrix.disagreements ? `, seeds disagree in ${matrix.disagreements.length} cell(s)` : "") : "no matrix yet";
   if (!matrix) { document.getElementById("mx").innerHTML = '<p class="muted">Run the matrix to fill this table.</p>'; return; }
   const cls = { hazard: "cell-hazard", prevented: "cell-prevented", detected: "cell-detected", "not detected": "cell-not" };
   const mins = (s) => s === null ? "" : s < 120 ? `${s.toFixed(0)} s` : `${(s / 60).toFixed(1)} min`;
   const head = "<tr><th>Scenario</th>" + matrix.columns.map((c) => `<th>${esc(c)}</th>`).join("") + "</tr>";
   const body = matrix.scenarios.map((sc) => "<tr><td>" + esc(sc.key) + "</td>" + matrix.columns.map((c) => {
     const x = matrix.cells[sc.key][c];
-    const extra = x.outcome === "hazard" ? ` in ${mins(x.tth_s)}` : x.ttd_s !== null ? ` ${mins(x.ttd_s)}` : "";
-    return `<td class="${cls[x.outcome] || ""}" title="hazards: ${esc(x.hazards.join(", ") || "none")}; detected by ${esc(x.detected_by || "-")}">${esc(x.outcome.toUpperCase())}${esc(extra)}<br><span class="muted">av ${esc(x.availability_pct.toFixed(0))}%</span></td>`;
+    const n = x.n_seeds || 1, k = x.outcome_counts ? x.outcome_counts[x.outcome] : n;
+    const frac = n > 1 ? ` ${k}/${n}` : "";
+    const range = (m, lo, hi) => lo === undefined || lo === null || mins(lo) === mins(hi) ? mins(m) : `${mins(m)} [${mins(lo)}-${mins(hi)}]`;
+    const extra = x.outcome === "hazard" ? ` in ${range(x.tth_s, x.tth_min_s, x.tth_max_s)}` : x.ttd_s !== null ? ` ${range(x.ttd_s, x.ttd_min_s, x.ttd_max_s)}` : "";
+    const av = x.availability_min_pct !== undefined && x.availability_min_pct !== x.availability_max_pct ?
+      `${x.availability_pct.toFixed(0)}% [${x.availability_min_pct.toFixed(0)}-${x.availability_max_pct.toFixed(0)}]` : `${x.availability_pct.toFixed(0)}%`;
+    const flag = x.agree === false ? `<br><span class="bad">seeds disagree: ${esc(x.outcome_label)}</span>` : "";
+    const per = (x.per_seed || []).map((p) => `seed ${p.seed}: ${p.outcome}`).join(", ");
+    return `<td class="${cls[x.outcome] || ""}${x.agree === false ? " mixed" : ""}" title="hazards: ${esc(x.hazards.join(", ") || "none")}; detected by ${esc(x.detected_by || "-")}${per ? "; " + esc(per) : ""}">${esc(x.outcome.toUpperCase())}${esc(frac)}${esc(extra)}<br><span class="muted">av ${esc(av)}</span>${flag}</td>`;
   }).join("") + "</tr>").join("");
   const fp = "<tr><td class='muted'>baseline false alerts</td>" + matrix.columns.map((c) => `<td class="muted">${esc(matrix.baseline[c].false_alerts)}</td>`).join("") + "</tr>";
   document.getElementById("mx").innerHTML = `<table><thead>${head}</thead><tbody>${body}${fp}</tbody></table>`;
@@ -303,7 +311,8 @@ async function main() {
     runMsg.textContent = r.id ? `stopped, report ${r.id}` : "no real-time scenario running"; renderRuns();
   });
   document.getElementById("runMatrix").addEventListener("click", async () => {
-    await api("/api/matrix/run", { method: "POST" });
+    const seeds = Number(document.getElementById("mxSeeds").value) || 5;
+    await api("/api/matrix/run", { method: "POST", body: { seeds } });
     const timer = setInterval(async () => { if (!(await renderMatrix())) clearInterval(timer); }, 2000);
   });
 

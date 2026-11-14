@@ -66,8 +66,11 @@ class Client:
 
 
 def show(c):
-    ident = c.call(1, bytes([17]))
-    print("Server ID:", ident[2:-1].decode(errors="replace"))
+    try:
+        ident = c.call(1, bytes([17]))
+        print("Server ID:", ident[2:-1].decode(errors="replace"))
+    except socket.timeout:
+        print("Server ID: no response (FC 17 dropped, e.g. by the DPI firewall)")
     ir = c.registers(4, 0, 30)
     for addr, name, scale, unit in INPUTS:
         print(f"  {name:28s} {ir[addr] / scale:10.2f} {unit}")
@@ -76,8 +79,11 @@ def show(c):
     print("Setpoints:", ", ".join(f"{n}={v / s:g}" for n, v, s in zip(SETPOINTS, hr, SP_SCALE)))
     co = c.bits(1, 0, len(COILS))
     print("Coils:", ", ".join(f"{n}={v}" for n, v in zip(COILS, co)))
-    sis = c.bits(2, 0, 8, unit=2)
-    print(f"SIS (unit 2): tripped={sis[0]} bypassed={sis[7]}")
+    try:
+        sis = c.bits(2, 0, 8, unit=2)
+        print(f"SIS (unit 2): tripped={sis[0]} bypassed={sis[7]}")
+    except socket.timeout:
+        print("SIS (unit 2): no response (request dropped, e.g. by segmentation)")
 
 
 def main():
@@ -86,9 +92,15 @@ def main():
     ap.add_argument("--port", type=int, default=5020)
     ap.add_argument("--watch", type=float, default=0, help="repeat every N seconds")
     a = ap.parse_args()
-    c = Client(a.host, a.port)
+    try:
+        c = Client(a.host, a.port)
+    except OSError as exc:
+        raise SystemExit(f"cannot connect to {a.host}:{a.port}: {exc}")
     while True:
-        show(c)
+        try:
+            show(c)
+        except socket.timeout:
+            raise SystemExit(f"no response from {a.host}:{a.port} (request dropped or blocked)")
         if not a.watch:
             break
         time.sleep(a.watch)

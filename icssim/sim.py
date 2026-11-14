@@ -49,6 +49,7 @@ class Simulation:
         self.sis_values: dict = self.plant.sis_sensors()
         self.trend: deque = deque(maxlen=8640)
         self.trend_every = 10.0 if live else 60.0
+        self.recorder: list | None = None     # set to a list to capture every request and its policy decision
         self.last_snapshot_t = -1e9
 
     # --------------------------------------------------------- mitigations
@@ -90,20 +91,20 @@ class Simulation:
             return None
         info = mb.describe(pdu)
         t = self.t
-        if self.firewall.segmentation:
-            reason = self.firewall.check_segmentation(src, 1 if unit in (0, 255) else unit)
-            if reason:
-                self.events.modbus_tx(t, src, zone, unit, info, "blocked", reason, transport, count)
-                self._alert_once("segmentation", src, f"Segmentation dropped {count} request(s) from {src} ({zone}): {reason}")
-                return None
-        if self.firewall.dpi:
-            allowed, reason = self.firewall.check_dpi(src, 1 if unit in (0, 255) else unit, info, t, count)
-            if reason:
-                self.events.modbus_tx(t, src, zone, unit, info, "blocked", reason, transport, count - allowed)
-                self._alert_once("firewall", src + reason[:12], f"Firewall blocked {count - allowed} request(s) from {src}: {reason}")
-            if allowed == 0:
-                return None
-            count = allowed
+        allowed, layer, reason = self.firewall.decide(src, 1 if unit in (0, 255) else unit, info, t, count)
+        if self.recorder is not None:
+            self.recorder.append({"t": t, "src": src, "unit": unit, "adu": adu.hex(), "count": count,
+                                  "routine": routine, "allowed": allowed, "layer": layer, "reason": reason})
+        if layer == "segmentation":
+            self.events.modbus_tx(t, src, zone, unit, info, "blocked", reason, transport, count)
+            self._alert_once("segmentation", src, f"Segmentation dropped {count} request(s) from {src} ({zone}): {reason}")
+            return None
+        if layer == "firewall":
+            self.events.modbus_tx(t, src, zone, unit, info, "blocked", reason, transport, count - allowed)
+            self._alert_once("firewall", src + reason[:12], f"Firewall blocked {count - allowed} request(s) from {src}: {reason}")
+        if allowed == 0:
+            return None
+        count = allowed
         if unit in (0, 1, 255):
             admitted = self.plc.comm_admit(count)
             if admitted < count:

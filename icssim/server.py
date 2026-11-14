@@ -19,13 +19,17 @@ from .constants import HAZARDS, MITIGATION_LABELS, MITIGATIONS
 from .modbus import serve_tcp
 from .network import HOSTS, LAB_CLIENT_IP, ZONES, policy_table, zone_of
 from .registers import C, HR_BY_NAME, PLC_COILS, register_map
-from .runner import collect, matrix, run, run_with_baseline
+from .runner import DEFAULT_SEEDS, MAX_SEEDS, collect, matrix, run, run_with_baseline
 from .scenarios import ATTACK_AT, HORIZON, SCENARIOS, get
 from .sim import Simulation
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-MODBUS_HOST = "127.0.0.1"
+MODBUS_HOST = os.environ.get("ICSSIM_MODBUS_HOST", "127.0.0.1")
 MODBUS_PORT = int(os.environ.get("ICSSIM_MODBUS_PORT", "5020"))
+# Containerised network mode: the gateway in front of the PLC forwards each client's
+# address in a PROXY v1 header, and requests are attributed to that real address
+# instead of the HUD's "external clients appear as" choice. Only these peers are trusted.
+TRUSTED_PROXIES = frozenset(filter(None, os.environ.get("ICSSIM_TRUSTED_PROXIES", "").split(",")))
 DEFAULT_LIVE_MITIGATIONS = {"sis", "detector", "integrity"}
 
 
@@ -37,7 +41,7 @@ class Live:
         self.paused = False
         self.ext_ip = LAB_CLIENT_IP
         self.reset(seed)
-        self.matrix_job = {"running": False, "done": 0, "total": 0, "error": None}
+        self.matrix_job = {"running": False, "done": 0, "total": 0, "error": None, "seeds": DEFAULT_SEEDS}
 
     def reset(self, seed: int = 1, mitigations=None) -> None:
         mits = mitigations if mitigations is not None else getattr(self, "sim", None) and self.sim.mitigations
@@ -118,15 +122,16 @@ async def _sim_loop():
         last = now
 
 
-def _modbus_handler(peer_ip: str, adu: bytes):
-    # Real TCP clients are mapped to a simulated source address chosen in the HUD.
-    return live.sim.request(live.ext_ip, adu, transport="tcp")
+def _modbus_handler(peer_ip: str, adu: bytes, proxied: bool = False):
+    # Local TCP clients are mapped to a simulated source address chosen in the HUD.
+    # Requests relayed by a trusted gateway keep the address the gateway saw on the wire.
+    return live.sim.request(peer_ip if proxied else live.ext_ip, adu, transport="tcp")
 
 
 async def _startup(app):
     app.state.tasks = [asyncio.create_task(_sim_loop())]
     try:
-        app.state.modbus = await serve_tcp(_modbus_handler, MODBUS_HOST, MODBUS_PORT)
+        app.state.modbus = await serve_tcp(_modbus_handler, MODBUS_HOST, MODBUS_PORT, trusted_proxies=TRUSTED_PROXIES)
         live.sim.events.add(0, "system", f"Modbus/TCP listening on {MODBUS_HOST}:{MODBUS_PORT}", "info", "system")
     except OSError as exc:
         app.state.modbus = None
@@ -322,10 +327,10 @@ def run_detail(run_id: str):
 
 
 # ------------------------------------------------------------------ matrix
-def _matrix_worker():
+def _matrix_worker(n_seeds: int, first_seed: int):
     job = live.matrix_job
     try:
-        mx = matrix(progress=lambda d, t: job.update(done=d, total=t))
+        mx = matrix(seed=first_seed, n_seeds=n_seeds, progress=lambda d, t: job.update(done=d, total=t))
         storage.save_matrix(mx)
     except Exception as exc:
         job["error"] = repr(exc)
@@ -333,19 +338,47 @@ def _matrix_worker():
         job["running"] = False
 
 
+class MatrixReq(BaseModel):
+    seeds: int = DEFAULT_SEEDS
+    first_seed: int = 1
+
+
 @app.post("/api/matrix/run")
-def matrix_run():
+def matrix_run(req: MatrixReq | None = None):
+    """Start a matrix run in the background. Optional body: {"seeds": 5, "first_seed": 1}."""
+    req = req or MatrixReq()
+    if not 1 <= req.seeds <= MAX_SEEDS:
+        raise HTTPException(400, f"seeds must be between 1 and {MAX_SEEDS}")
     job = live.matrix_job
     if job["running"]:
         return job
-    job.update(running=True, done=0, total=0, error=None)
-    threading.Thread(target=_matrix_worker, daemon=True).start()
+    job.update(running=True, done=0, total=0, error=None, seeds=req.seeds)
+    threading.Thread(target=_matrix_worker, args=(req.seeds, req.first_seed), daemon=True).start()
     return job
 
 
 @app.get("/api/matrix")
 def matrix_get():
     return {"job": live.matrix_job, "matrix": storage.latest_matrix()}
+
+
+@app.get("/api/matrix/cells")
+def matrix_cells():
+    """The latest matrix flattened to one row per scenario x column (for the terminal HUD and scripts)."""
+    mx = storage.latest_matrix()
+    if not mx:
+        return {"generated": None, "seeds": [], "disagreements": 0, "rows": []}
+    rows = []
+    for sc in mx["scenarios"]:
+        for col in mx["columns"]:
+            c = mx["cells"][sc["key"]][col]
+            rows.append({"scenario": sc["key"], "column": col, "outcome": c["outcome"],
+                         "label": c.get("outcome_label", c["outcome"]), "agree": c.get("agree", True),
+                         "ttd_s": c["ttd_s"], "ttd_min_s": c.get("ttd_min_s"), "ttd_max_s": c.get("ttd_max_s"),
+                         "tth_s": c["tth_s"], "availability_pct": c["availability_pct"],
+                         "availability_min_pct": c.get("availability_min_pct")})
+    return {"generated": mx["generated"], "seeds": mx.get("seeds", [mx["seed"]]), "wall_s": mx["wall_s"],
+            "disagreements": sum(1 for r in rows if not r["agree"]), "rows": rows}
 
 
 # ------------------------------------------------------------------ reports

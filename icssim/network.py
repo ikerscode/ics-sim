@@ -95,6 +95,22 @@ class Firewall:
             return f"zone {zone} may not reach unit {unit} (Purdue policy)"
         return None
 
+    def decide(self, src: str, unit: int, info: dict, t: float, count: int = 1) -> tuple[int, str | None, str | None]:
+        """Apply the enabled layers in order: segmentation, then DPI.
+
+        Returns (requests allowed, blocking layer or None, reason or None). The
+        simulator's bus and the containerised gateway's checks are compared
+        against this one function, so it is the reference policy decision.
+        """
+        if self.segmentation:
+            reason = self.check_segmentation(src, unit)
+            if reason:
+                return 0, "segmentation", reason
+        if self.dpi:
+            allowed, reason = self.check_dpi(src, unit, info, t, count)
+            return allowed, ("firewall" if reason else None), reason
+        return count, None, None
+
     def check_dpi(self, src: str, unit: int, info: dict, t: float, count: int = 1) -> tuple[int, str | None]:
         """Return (number of requests allowed, reason for blocking the rest)."""
         pol = DPI_POLICY.get(src)
@@ -105,6 +121,9 @@ class Firewall:
         fc = info["fc"]
         if fc not in pol["fcs"]:
             return 0, f"function code {fc} not allowed for {pol['role']}"
+        if info.get("malformed"):
+            # A truncated PDU cannot be checked against the write allowlist, so DPI drops it.
+            return 0, "malformed request"
         if info.get("write") and fc in (5, 6, 15, 16):
             allowed = pol[info["kind"]]
             if allowed != ALL:
@@ -131,3 +150,21 @@ def policy_table() -> list[dict]:
         rows.append({"source": ip, "host": HOSTS.get(ip, ""), "role": p["role"], "units": fmt(p["units"]),
                      "function_codes": fmt(p["fcs"]), "holding_writes": fmt(p["hr"]), "coil_writes": fmt(p["coil"])})
     return rows
+
+
+def export_policy() -> dict:
+    """The zone table, segmentation and DPI policy as plain JSON.
+
+    The containerised gateway (icssim/fwgate.py) loads this instead of importing
+    this module, so its rule engine is a separate implementation of the same policy.
+    """
+    def enc(v):
+        return "all" if v == ALL else sorted(v)
+    return {
+        "zones": [{"key": z["key"], "cidr": z["cidr"]} for z in ZONES],
+        "segment_allowed": {str(u): sorted(z) for u, z in SEGMENT_ALLOWED.items()},
+        "dpi": {ip: {"role": p["role"], "units": enc(p["units"]), "fcs": enc(p["fcs"]),
+                     "hr": enc(p["hr"]), "coil": enc(p["coil"])} for ip, p in DPI_POLICY.items()},
+        "rate_per_s": RATE_PER_S,
+        "burst": BURST,
+    }

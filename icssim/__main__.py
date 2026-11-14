@@ -4,7 +4,9 @@
     python -m icssim list
     python -m icssim baseline [--hours 24] [--mitigations sis,detector]
     python -m icssim run-scenario <name> [--mitigations a,b|all|none] [--fast] [--speed 60]
-    python -m icssim matrix [--workers 2]
+    python -m icssim matrix [--seeds 5] [--seed 1] [--workers 2] [--write-docs]
+    python -m icssim export-policy [--out policy.json]
+    python -m icssim netmode plan <scenario> | verify | down
     python -m icssim report [<run-id>]
     python -m icssim docs
     python -m icssim tui [--url http://127.0.0.1:8104] [--once]
@@ -128,7 +130,10 @@ def cmd_matrix(args):
 
     def progress(d, t):
         print(f"\r{d}/{t} runs", end="", flush=True)
-    mx = matrix(seed=args.seed, workers=args.workers, progress=progress)
+    try:
+        mx = matrix(seed=args.seed, workers=args.workers, progress=progress, n_seeds=args.seeds)
+    except ValueError as exc:
+        sys.exit(str(exc))
     print()
     storage.save_matrix(mx)
     md = matrix_markdown(mx)
@@ -136,8 +141,33 @@ def cmd_matrix(args):
     if args.write_docs:
         Path("docs/MATRIX.md").write_text(md)
         print("wrote docs/MATRIX.md")
-    print(f"saved data/reports/matrix.md and .html ({mx['wall_s']} s)")
+    if mx["disagreements"]:
+        print("seeds disagree in: " + ", ".join(f"{d['scenario']}/{d['column']} ({d['label']})" for d in mx["disagreements"]))
+    print(f"saved data/reports/matrix.md and .html ({mx['runs']} runs, {mx['wall_s']} s wall on {mx['workers']} workers)")
     return 0
+
+
+def cmd_export_policy(args):
+    from .network import export_policy
+    text = json.dumps(export_policy(), indent=1, sort_keys=True)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+def cmd_netmode(args):
+    from . import netmode
+    if args.action == "plan":
+        if not args.scenario:
+            sys.exit("netmode plan needs a scenario name")
+        print(json.dumps(netmode.build_plan(args.scenario), indent=1))
+        return 0
+    if args.action == "down":
+        return netmode.compose(["down", "--remove-orphans"]).returncode
+    return netmode.verify(keep_up=args.keep_up, build=not args.no_build)
 
 
 def cmd_report(args):
@@ -187,15 +217,25 @@ def main(argv=None) -> int:
     p.add_argument("--port", type=int, default=8104)
     p.add_argument("--seed", type=int, default=1)
     p.set_defaults(fn=cmd_run)
-    p = sub.add_parser("matrix", help="run every scenario x mitigation fast-forward")
+    p = sub.add_parser("matrix", help="run every scenario x mitigation fast-forward over several seeds")
     p.add_argument("--workers", type=int, default=2)
-    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--seed", type=int, default=1, help="first seed")
+    p.add_argument("--seeds", type=int, default=5, help="seeds per cell (1-10)")
     p.add_argument("--write-docs", action="store_true", help="also write docs/MATRIX.md")
     p.set_defaults(fn=cmd_matrix)
     p = sub.add_parser("report", help="list reports or print one")
     p.add_argument("run_id", nargs="?")
     p.set_defaults(fn=cmd_report)
     sub.add_parser("docs", help="regenerate docs/REGISTER_MAP.md").set_defaults(fn=cmd_docs)
+    p = sub.add_parser("export-policy", help="print the zone, segmentation and DPI policy as JSON")
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_export_policy)
+    p = sub.add_parser("netmode", help="containerised network mode (docker compose): plan, verify, down")
+    p.add_argument("action", choices=["plan", "verify", "down"])
+    p.add_argument("scenario", nargs="?")
+    p.add_argument("--keep-up", action="store_true", help="leave the containers running after verify")
+    p.add_argument("--no-build", action="store_true", help="reuse the existing image")
+    p.set_defaults(fn=cmd_netmode)
     p = sub.add_parser("tui", help="terminal HUD against the running server")
     p.add_argument("--url", default="http://127.0.0.1:8104")
     p.add_argument("--once", action="store_true", help="print every view as plain text and exit")

@@ -268,25 +268,58 @@ def _device_id(bank: DataBank, pdu: bytes) -> bytes:
 
 
 # ------------------------------------------------------------- TCP server
-async def serve_tcp(handler: Callable[[str, bytes], bytes | None], host: str = "127.0.0.1",
-                    port: int = 5020) -> asyncio.base_events.Server:
-    """Start a Modbus/TCP listener. handler(peer_ip, adu) returns the reply ADU or None (dropped)."""
+PROXY_V1_MAX = 107   # longest legal PROXY protocol v1 line, CRLF included
+
+
+def parse_proxy_v1(line: bytes) -> str | None:
+    """Source address from a PROXY protocol v1 line ('PROXY TCP4 src dst sport dport CRLF').
+
+    Returns None for 'PROXY UNKNOWN'. Raises ValueError for anything malformed.
+    """
+    import ipaddress
+    if len(line) > PROXY_V1_MAX or not line.endswith(b"\r\n"):
+        raise ValueError("bad PROXY line length")
+    parts = line[:-2].decode("ascii").split(" ")
+    if parts[:2] == ["PROXY", "UNKNOWN"]:
+        return None
+    if len(parts) != 6 or parts[0] != "PROXY" or parts[1] not in ("TCP4", "TCP6"):
+        raise ValueError("bad PROXY line")
+    src = ipaddress.ip_address(parts[2])
+    ipaddress.ip_address(parts[3])
+    for port in parts[4:]:
+        if not port.isdigit() or not 0 <= int(port) <= 65535:
+            raise ValueError("bad PROXY port")
+    return str(src)
+
+
+async def serve_tcp(handler: Callable[..., bytes | None], host: str = "127.0.0.1",
+                    port: int = 5020, trusted_proxies=frozenset()) -> asyncio.base_events.Server:
+    """Start a Modbus/TCP listener. handler(peer_ip, adu) returns the reply ADU or None (dropped).
+
+    Connections from an address in `trusted_proxies` must start with a PROXY v1 line; the
+    handler is then called as handler(original_source, adu, proxied=True). Nobody else can
+    claim a source address, because the header is only read from those peers.
+    """
 
     async def client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
         peer_ip = peer[0] if peer else "?"
+        proxied = peer_ip in trusted_proxies
         try:
+            if proxied:
+                line = await reader.readuntil(b"\r\n")
+                peer_ip = parse_proxy_v1(line) or peer_ip
             while True:
                 head = await reader.readexactly(7)
                 length = struct.unpack(">H", head[4:6])[0]
                 if length < 2 or length > 254:
                     break
                 body = await reader.readexactly(length - 1)
-                reply = handler(peer_ip, head + body)
+                reply = handler(peer_ip, head + body, proxied=True) if proxied else handler(peer_ip, head + body)
                 if reply is not None:
                     writer.write(reply)
                     await writer.drain()
-        except (asyncio.IncompleteReadError, ConnectionError):
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, ValueError):
             pass
         finally:
             writer.close()
