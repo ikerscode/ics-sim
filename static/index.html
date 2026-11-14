@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ics-sim</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/hud.css">
+<style>
+  .bad { color: var(--crit); font-weight: bold; }
+  .cell-hazard { color: var(--crit); } .cell-prevented { color: var(--ok); }
+  .cell-detected { color: var(--warn); } .cell-not { color: var(--muted); }
+  td input { width: 90px; }
+  label { margin-right: 10px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header class="hud">
+  <span class="brand">ics-sim</span>
+  <span class="sub" id="hdr">water treatment works · HMI 8104 · Modbus 127.0.0.1:5020</span>
+  <nav>
+    <button data-view="plant">Plant</button>
+    <button data-view="scenarios">Scenarios</button>
+    <button data-view="matrix">Matrix &amp; Log</button>
+  </nav>
+</header>
+<main>
+  <!-- ============================ PLANT ============================ -->
+  <section class="view" id="plant">
+    <div class="grid">
+      <div class="panel span-8">
+        <h2>Process values <span class="muted" id="viewinfo"></span></h2>
+        <div class="row" style="margin-bottom:6px">
+          <label><input type="checkbox" id="showTruth" checked> show ground truth next to the HMI value</label>
+        </div>
+        <div id="values" class="scroll"></div>
+      </div>
+      <div class="panel span-4">
+        <h2>Simulation</h2>
+        <div id="status"></div>
+        <div class="row" style="margin:8px 0">
+          <button class="btn" data-sim="pause">Pause</button>
+          <button class="btn" data-sim="resume">Resume</button>
+          <select id="speed"><option>1</option><option selected>10</option><option>60</option><option>300</option></select>
+          <button class="btn" id="setSpeed">Set speed</button>
+        </div>
+        <div class="row">
+          <button class="btn" data-sim="ack">Ack alarms</button>
+          <button class="btn" data-sim="sis_reset">SIS reset</button>
+          <button class="btn" data-sim="plc_reset">PLC restart</button>
+          <button class="btn danger" data-sim="reset">Reset plant</button>
+        </div>
+        <h2 style="margin-top:12px">Live mitigations</h2>
+        <div id="liveMits"></div>
+        <button class="btn primary" id="applyMits" style="margin-top:6px">Apply</button>
+        <h2 style="margin-top:12px">Consequences <span class="muted" id="since"></span></h2>
+        <div id="metrics"></div>
+      </div>
+      <div class="panel span-6">
+        <h2>Operator controls (Modbus writes from HMI-01)</h2>
+        <div id="coils"></div>
+        <div id="setpoints" class="scroll" style="margin-top:8px"></div>
+      </div>
+      <div class="panel span-6">
+        <h2>Trend</h2>
+        <select id="trendSel">
+          <option value="cl">Free chlorine (contact, final)</option>
+          <option value="ph">pH (contact, final)</option>
+          <option value="lvl">Tank levels</option>
+          <option value="press">Network pressure</option>
+          <option value="flow">Flows and demand</option>
+          <option value="temp">P-201 temperature</option>
+        </select>
+        <div id="trend"></div>
+        <h2 style="margin-top:12px">Active alarms (HMI view)</h2>
+        <div id="alarms"></div>
+      </div>
+      <div class="panel span-12">
+        <h2>Events and alerts</h2>
+        <div class="row" style="margin-bottom:6px">
+          <select id="evKind"><option value="">all</option><option>alert</option><option>alarm</option><option>attack</option>
+            <option>hazard</option><option>sis</option><option>operator</option><option>plc</option><option>hmi</option><option>system</option></select>
+        </div>
+        <div id="events" class="scroll"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ SCENARIOS ============================ -->
+  <section class="view" id="scenarios">
+    <div class="grid">
+      <div class="panel span-4">
+        <h2>Scenario</h2>
+        <select id="scSel" style="width:100%"></select>
+        <div id="scInfo" style="margin-top:8px"></div>
+        <h2 style="margin-top:12px">Mitigations for this run</h2>
+        <div id="scMits"></div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn primary" id="runFast">Run fast-forward</button>
+          <button class="btn" id="runLive">Run real-time on live plant</button>
+          <button class="btn" id="stopLive">Stop real-time</button>
+        </div>
+        <p class="muted" id="runMsg"></p>
+      </div>
+      <div class="panel span-8">
+        <h2>Result</h2>
+        <div id="result"><p class="muted">Pick a scenario and run it. Fast-forward runs 3 simulated hours plus a baseline in a few seconds.</p></div>
+      </div>
+      <div class="panel span-12">
+        <h2>Past runs and reports</h2>
+        <div id="runs" class="scroll"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ MATRIX & LOG ============================ -->
+  <section class="view" id="matrix">
+    <div class="grid">
+      <div class="panel span-12">
+        <h2>Scenario x mitigation matrix</h2>
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn primary" id="runMatrix">Run matrix (about a minute)</button>
+          <span class="muted" id="mxStatus"></span>
+          <a href="/api/reports/matrix.html" target="_blank">matrix.html</a>
+          <a href="/api/reports/matrix.md">matrix.md</a>
+        </div>
+        <div id="mx" class="scroll"></div>
+      </div>
+      <div class="panel span-6">
+        <h2>Modbus transaction log</h2>
+        <div class="row" style="margin-bottom:6px">
+          <span class="muted">External TCP clients on 5020 appear as</span>
+          <select id="extIp"></select>
+          <button class="btn" id="setExt">Set</button>
+        </div>
+        <div id="mbCount" class="muted"></div>
+        <div id="mblog" class="scroll"></div>
+      </div>
+      <div class="panel span-6">
+        <h2>Network: Purdue zones and firewall policy</h2>
+        <div id="zones"></div>
+        <div id="policy" style="margin-top:8px"></div>
+      </div>
+      <div class="panel span-12">
+        <h2>Register map</h2>
+        <div class="row" style="margin-bottom:6px">
+          <select id="regDev"><option value="plc">PLC-01 (unit 1)</option><option value="sis">SIS-01 (unit 2)</option></select>
+          <select id="regKind"><option value="hr">holding</option><option value="ir">input</option><option value="coil">coils</option><option value="di">discrete inputs</option></select>
+        </div>
+        <div id="regs" class="scroll"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script src="/static/hud.js?v=0.1.0"></script>
+<script src="/static/app.js?v=0.1.0"></script>
+</body>
+</html>

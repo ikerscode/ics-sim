@@ -1,0 +1,5 @@
+# All of these come from the system site-packages on this machine; listed for completeness.
+fastapi
+uvicorn
+httpx
+pytest
