@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .localguard import LocalGuard
 from . import NAME, __version__, storage
 from .constants import HAZARDS, MITIGATION_LABELS, MITIGATIONS
 from .modbus import serve_tcp
@@ -149,6 +150,9 @@ async def lifespan(app):
 
 
 app = FastAPI(title="ics-sim", version=__version__, lifespan=lifespan)
+
+
+app.add_middleware(LocalGuard)  # localhost-only: host allowlist, CSRF block, CSP
 
 
 # ------------------------------------------------------------------ basics

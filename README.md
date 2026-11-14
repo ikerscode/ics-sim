@@ -94,6 +94,24 @@ The HUD has three tabs and every core feature has its own button.
   unit, function code, address, value, allowed/blocked/dropped and why), the mapping for external TCP
   clients, the Purdue zones and firewall policy, and the register map for both units.
 
+## Terminal HUD
+
+A curses view of the same live API, for working over SSH or from a second terminal. Start the server
+with `./run.sh` first, then:
+
+    python -m icssim tui                      # http://127.0.0.1:8104 by default
+    python -m icssim tui --url http://127.0.0.1:8104 --once
+
+The views are Plant (HMI values and alarms, refreshed every 2 s), Scenarios, Reports (Enter opens a
+run's JSON) and Modbus log. The spec lives in `icssim/tui_spec.py`.
+
+- Keys: `1`-`9` or Tab switch view, Up/Down/PgUp/PgDn move, Enter opens a detail, Esc or Backspace
+  goes back, `q` quits.
+- Action keys: `f` oldsmar fast-forward with no mitigations, `m` oldsmar with all mitigations,
+  `x` run the matrix (asks first), `z` reset the plant (asks first), `a` acknowledge alarms.
+- `--once` prints every view as plain text and exits, which suits SSH sessions without a usable
+  terminal or scripted checks. It exits 1 if any view cannot reach the server.
+
 ## How each requirement is met
 
 | Requirement | Where |

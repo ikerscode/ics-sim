@@ -7,6 +7,7 @@
     python -m icssim matrix [--workers 2]
     python -m icssim report [<run-id>]
     python -m icssim docs
+    python -m icssim tui [--url http://127.0.0.1:8104] [--once]
 """
 
 from __future__ import annotations
@@ -159,6 +160,12 @@ def cmd_docs(args):
     return 0
 
 
+def cmd_tui(args):
+    from . import termhud
+    from .tui_spec import SPEC
+    return termhud.run(SPEC, args.url, args.once)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m icssim", description="Water treatment ICS security simulator")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -189,6 +196,10 @@ def main(argv=None) -> int:
     p.add_argument("run_id", nargs="?")
     p.set_defaults(fn=cmd_report)
     sub.add_parser("docs", help="regenerate docs/REGISTER_MAP.md").set_defaults(fn=cmd_docs)
+    p = sub.add_parser("tui", help="terminal HUD against the running server")
+    p.add_argument("--url", default="http://127.0.0.1:8104")
+    p.add_argument("--once", action="store_true", help="print every view as plain text and exit")
+    p.set_defaults(fn=cmd_tui)
     args = ap.parse_args(argv)
     return args.fn(args) or 0
 
