@@ -1,3 +1,5 @@
+[![tests](https://github.com/ikerscode/ics-sim/actions/workflows/tests.yml/badge.svg)](https://github.com/ikerscode/ics-sim/actions/workflows/tests.yml)
+
 # ics-sim
 
 A simulated drinking water treatment works with its control system, built to study how attacks on
