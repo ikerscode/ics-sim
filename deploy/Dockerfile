@@ -1,5 +1,5 @@
 # One image for every container of the network mode; the compose command picks the role.
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 RUN pip install --no-cache-dir --retries 10 --timeout 60 \
         "fastapi==0.115.6" "uvicorn==0.34.0" "pydantic==2.10.4" \
