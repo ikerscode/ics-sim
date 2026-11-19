@@ -188,6 +188,8 @@ implementation (about 300 lines) made that simpler and removed a dependency.
 
 ## Results
 
+A sample penetration test report on this simulator (four findings, CVSS scores, evidence, retests) is in [docs/PENTEST-REPORT.md](docs/PENTEST-REPORT.md).
+
 The full matrix with times is in [docs/MATRIX.md](docs/MATRIX.md) (regenerate with `python -m icssim matrix --write-docs`).
 It now runs every cell for five seeds (1-5). That is 405 runs including the baselines, which took
 344 s wall time on the two-worker pool under the lab CPU lock at nice 19, with other jobs running on the
